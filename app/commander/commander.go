@@ -5,22 +5,54 @@ import (
 	"net"
 	"sync"
 
+	"github.com/xtls/xray-core/app/limiter"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/signal/done"
 	core "github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/outbound"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 )
+
+var pendingAPIRateLimit struct {
+	sync.Mutex
+	rate      float64
+	burst     int
+	whitelist []string
+}
+
+func SetPendingAPIRateLimit(rate float64, burst int, whitelist []string) {
+	pendingAPIRateLimit.Lock()
+	defer pendingAPIRateLimit.Unlock()
+	pendingAPIRateLimit.rate = rate
+	pendingAPIRateLimit.burst = burst
+	pendingAPIRateLimit.whitelist = whitelist
+}
+
+func takePendingAPIRateLimit() (rate float64, burst int, whitelist []string) {
+	pendingAPIRateLimit.Lock()
+	defer pendingAPIRateLimit.Unlock()
+	rate = pendingAPIRateLimit.rate
+	burst = pendingAPIRateLimit.burst
+	whitelist = pendingAPIRateLimit.whitelist
+	pendingAPIRateLimit.rate = 0
+	pendingAPIRateLimit.burst = 0
+	pendingAPIRateLimit.whitelist = nil
+	return rate, burst, whitelist
+}
 
 // Commander is a Xray feature that provides gRPC methods to external clients.
 type Commander struct {
 	sync.Mutex
-	server   *grpc.Server
-	services []Service
-	ohm      outbound.Manager
-	tag      string
-	listen   string
+	server     *grpc.Server
+	services   []Service
+	ohm        outbound.Manager
+	tag        string
+	listen     string
+	apiLimiter *limiter.APIRateLimiter
 }
 
 // NewCommander creates a new Commander based on the given config.
@@ -35,11 +67,11 @@ func NewCommander(ctx context.Context, config *Config) (*Commander, error) {
 	}))
 
 	for _, rawConfig := range config.Service {
-		config, err := rawConfig.GetInstance()
+		svcConfig, err := rawConfig.GetInstance()
 		if err != nil {
 			return nil, err
 		}
-		rawService, err := common.CreateObject(ctx, config)
+		rawService, err := common.CreateObject(ctx, svcConfig)
 		if err != nil {
 			return nil, err
 		}
@@ -48,6 +80,14 @@ func NewCommander(ctx context.Context, config *Config) (*Commander, error) {
 			return nil, errors.New("not a Service.")
 		}
 		c.services = append(c.services, service)
+	}
+
+	if rate, burst, whitelist := takePendingAPIRateLimit(); rate > 0 {
+		c.apiLimiter = limiter.NewAPIRateLimiter(limiter.APIRateLimitConfig{
+			Rate:        rate,
+			Burst:       burst,
+			WhitelistIP: whitelist,
+		})
 	}
 
 	return c, nil
@@ -61,7 +101,14 @@ func (c *Commander) Type() interface{} {
 // Start implements common.Runnable.
 func (c *Commander) Start() error {
 	c.Lock()
-	c.server = grpc.NewServer()
+	var opts []grpc.ServerOption
+	if c.apiLimiter != nil {
+		opts = append(opts,
+			grpc.UnaryInterceptor(c.apiRateLimitUnaryInterceptor),
+			grpc.StreamInterceptor(c.apiRateLimitStreamInterceptor),
+		)
+	}
+	c.server = grpc.NewServer(opts...)
 	for _, service := range c.services {
 		service.Register(c.server)
 	}
@@ -106,12 +153,37 @@ func (c *Commander) Close() error {
 	c.Lock()
 	defer c.Unlock()
 
+	if c.apiLimiter != nil {
+		c.apiLimiter.Stop()
+		c.apiLimiter = nil
+	}
 	if c.server != nil {
 		c.server.Stop()
 		c.server = nil
 	}
 
 	return nil
+}
+
+func (c *Commander) clientIP(ctx context.Context) string {
+	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
+		return p.Addr.String()
+	}
+	return ""
+}
+
+func (c *Commander) apiRateLimitUnaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	if c.apiLimiter != nil && !c.apiLimiter.Allow(c.clientIP(ctx)) {
+		return nil, status.Errorf(codes.ResourceExhausted, "api rate limit exceeded")
+	}
+	return handler(ctx, req)
+}
+
+func (c *Commander) apiRateLimitStreamInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	if c.apiLimiter != nil && !c.apiLimiter.Allow(c.clientIP(ss.Context())) {
+		return status.Errorf(codes.ResourceExhausted, "api rate limit exceeded")
+	}
+	return handler(srv, ss)
 }
 
 func init() {

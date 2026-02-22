@@ -14,9 +14,12 @@ import (
 )
 
 type APIConfig struct {
-	Tag      string   `json:"tag"`
-	Listen   string   `json:"listen"`
-	Services []string `json:"services"`
+	Tag                string   `json:"tag"`
+	Listen             string   `json:"listen"`
+	Services           []string `json:"services"`
+	RateLimit          float64  `json:"rateLimit"`
+	RateLimitBurst     int      `json:"rateLimitBurst"`
+	RateLimitWhitelist []string `json:"rateLimitWhitelist"`
 }
 
 func (c *APIConfig) Build() (*commander.Config, error) {
@@ -42,6 +45,13 @@ func (c *APIConfig) Build() (*commander.Config, error) {
 		}
 	}
 
+	if c.RateLimit > 0 {
+		burst := c.RateLimitBurst
+		if burst <= 0 {
+			burst = 1
+		}
+		commander.SetPendingAPIRateLimit(c.RateLimit, burst, c.RateLimitWhitelist)
+	}
 	return &commander.Config{
 		Tag:     c.Tag,
 		Listen:  c.Listen,

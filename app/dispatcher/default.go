@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xtls/xray-core/app/limiter"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -94,11 +95,12 @@ func (r *cachedReader) Interrupt() {
 
 // DefaultDispatcher is a default implementation of Dispatcher.
 type DefaultDispatcher struct {
-	ohm    outbound.Manager
-	router routing.Router
-	policy policy.Manager
-	stats  stats.Manager
-	fdns   dns.FakeDNSEngine
+	ohm     outbound.Manager
+	router  routing.Router
+	policy  policy.Manager
+	stats   stats.Manager
+	fdns    dns.FakeDNSEngine
+	limiter *limiter.Limiter
 }
 
 func init() {
@@ -122,6 +124,7 @@ func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router rou
 	d.router = router
 	d.policy = pm
 	d.stats = sm
+	d.limiter = limiter.New()
 	return nil
 }
 
@@ -160,6 +163,19 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 	}
 
 	if user != nil && len(user.Email) > 0 {
+		bucket, ok, reject := d.limiter.Get(sessionInbound.Tag, user.Email, user.DeviceLimit, user.SpeedLimit, sessionInbound.Source.Address.IP().String())
+		if reject {
+			errors.LogWarning(ctx, "IP limit exceeded: ", user.Email)
+			common.Close(outboundLink.Writer)
+			common.Close(inboundLink.Writer)
+			common.Interrupt(outboundLink.Reader)
+			common.Interrupt(inboundLink.Reader)
+			return inboundLink, outboundLink
+		}
+		if ok {
+			inboundLink.Writer = d.limiter.RateWriter(inboundLink.Writer, bucket)
+			outboundLink.Writer = d.limiter.RateWriter(outboundLink.Writer, bucket)
+		}
 		p := d.policy.ForLevel(user.Level)
 		if p.Stats.UserUplink {
 			name := "user>>>" + user.Email + ">>>traffic>>>uplink"

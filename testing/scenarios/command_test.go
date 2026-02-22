@@ -426,7 +426,7 @@ func TestCommanderAddRemoveUser(t *testing.T) {
 					Receiver: &protocol.ServerEndpoint{
 						Address: net.NewIPOrDomain(net.LocalHostIP),
 						Port:    uint32(serverPort),
-						User:    &protocol.User{
+						User: &protocol.User{
 							Account: serial.ToTypedMessage(&vmess.Account{
 								Id: u2.String(),
 								SecuritySettings: &protocol.SecurityConfig{
@@ -599,7 +599,7 @@ func TestCommanderStats(t *testing.T) {
 					Receiver: &protocol.ServerEndpoint{
 						Address: net.NewIPOrDomain(net.LocalHostIP),
 						Port:    uint32(serverPort),
-						User:    &protocol.User{
+						User: &protocol.User{
 							Account: serial.ToTypedMessage(&vmess.Account{
 								Id: userID.String(),
 								SecuritySettings: &protocol.SecurityConfig{
@@ -660,5 +660,66 @@ func TestCommanderStats(t *testing.T) {
 	common.Must(err)
 	if sresp.Stat.Value <= 10240*1024 {
 		t.Error("value < 10240*1024: ", sresp.Stat.Value)
+	}
+}
+
+func TestCommanderAPIRateLimit(t *testing.T) {
+	tcpServer := tcp.Server{MsgProcessor: xor}
+	dest, err := tcpServer.Start()
+	common.Must(err)
+	defer tcpServer.Close()
+
+	clientPort := tcp.PickPort()
+	cmdPort := tcp.PickPort()
+	commander.SetPendingAPIRateLimit(2, 2, []string{"127.0.0.1"})
+	clientConfig := &core.Config{
+		App: []*serial.TypedMessage{
+			serial.ToTypedMessage(&commander.Config{
+				Tag:    "api",
+				Listen: fmt.Sprintf("127.0.0.1:%d", cmdPort),
+				Service: []*serial.TypedMessage{
+					serial.ToTypedMessage(&command.Config{}),
+				},
+			}),
+		},
+		Inbound: []*core.InboundHandlerConfig{
+			{
+				Tag: "d",
+				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
+				}),
+				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
+					Address:  net.NewIPOrDomain(dest.Address),
+					Port:     uint32(dest.Port),
+					Networks: []net.Network{net.Network_TCP},
+				}),
+			},
+		},
+		Outbound: []*core.OutboundHandlerConfig{
+			{
+				Tag:           "default-outbound",
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+			},
+		},
+	}
+
+	servers, err := InitializeServerConfigs(clientConfig)
+	common.Must(err)
+	defer CloseAllServers(servers)
+
+	cmdConn, err := grpc.Dial(fmt.Sprintf("127.0.0.1:%d", cmdPort), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+	common.Must(err)
+	defer cmdConn.Close()
+
+	hsClient := command.NewHandlerServiceClient(cmdConn)
+	for i := 0; i < 4; i++ {
+		resp, err := hsClient.ListInbounds(context.Background(), &command.ListInboundsRequest{})
+		if err != nil {
+			t.Fatalf("request %d: %v", i+1, err)
+		}
+		if resp == nil {
+			t.Fatalf("request %d: nil response", i+1)
+		}
 	}
 }
